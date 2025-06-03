@@ -1,0 +1,934 @@
+import os
+import time
+import configparser
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import json
+from sklearn.linear_model import LinearRegression
+import ccxt
+import telegram
+import logging
+from logging.handlers import RotatingFileHandler
+
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler("trading_bot.log", maxBytes=10485760, backupCount=5, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("trading_bot")
+
+class KuCoinSwingBot:
+    def __init__(self, config_file="config.txt"):
+        """Initialize the trading bot with configuration."""
+        # Load configuration
+        self.config = self._load_config(config_file)
+        
+        # Set up KuCoin API connection
+        self.exchange = self._setup_exchange()
+        
+        # Set up Telegram bot
+        self.telegram_bot = self._setup_telegram()
+        
+        # Trading parameters
+        self.symbols = self._get_top_usdt_symbols(top_n=30)  # Top 30 by 24h volume
+        self.timeframes = ['1h', '4h', '1d']  # Candlesticks for swing trading
+        self.default_ohlcv_timeframe = '1h' # Primary timeframe for single-frame operations
+        self.short_window = 9
+        self.long_window = 21
+        self.rsi_period = 14
+        self.rsi_overbought = 70
+        self.rsi_oversold = 30
+        self.bollinger_period = 20
+        self.bollinger_std = 2
+        self.volume_change_threshold = 20  # Percentage
+        
+        # Data structures for each symbol
+        self.trade_history = {symbol: [] for symbol in self.symbols}
+        self.signals_generated = {symbol: 0 for symbol in self.symbols}
+        self.successful_signals = {symbol: 0 for symbol in self.symbols}
+        self.active_trades = {symbol: [] for symbol in self.symbols}
+        self.last_signal_time = {symbol: None for symbol in self.symbols}
+        self.last_signal_direction = {symbol: 0 for symbol in self.symbols}
+        # self.last_signal_strength = {symbol: 0 for symbol in self.symbols} # Removed as strength not directly from generate_final_trade_signal
+        
+        # Stop loss and take profit parameters
+        self.default_stop_loss_pct = 2.0
+        self.default_take_profit_pct = 5.0
+        self.min_stop_loss_pct = 0.5
+        self.min_take_profit_pct = 1.0
+
+        self.price_history_files = {symbol: f"price_history_{symbol.replace('/', '_')}.json" for symbol in self.symbols}
+        self.price_history = {symbol: None for symbol in self.symbols}
+        
+        for symbol in self.symbols:
+            self.load_price_history(symbol)
+        
+        logger.info(f"Bot initialized to monitor multiple symbols: {', '.join(self.symbols)} on {self.timeframes} timeframes using {self.default_ohlcv_timeframe} as primary for context.")
+        self.send_telegram_info(f"🚀 Trading Bot Started\nMonitoring multiple symbols: {', '.join(self.symbols)} on {self.timeframes} timeframes using {self.default_ohlcv_timeframe} as primary for context.")
+
+    def send_signal_message(self, message):
+        """Send a signal message via Telegram and return the message object."""
+        try:
+            sent_message = self.telegram_bot.send_message(
+                chat_id=self.config['telegram_chat_id'],
+                text=message,
+                parse_mode=telegram.ParseMode.MARKDOWN
+            )
+            logger.info(f"Signal message sent: {message[:50]}...")
+            return sent_message
+        except Exception as e:
+            logger.error(f"Failed to send signal message: {str(e)}")
+            return None
+    
+    def get_telegram_message_link(self, chat_id, message_id):
+        """Returns a t.me link to the message."""
+        if str(chat_id).startswith('-100'):
+            return f"https://t.me/c/{str(chat_id)[4:]}/{message_id}"
+        else:
+            return f"https://t.me/c/{str(chat_id)}/{message_id}" # May not work for all private group types
+    
+    def _get_top_usdt_symbols(self, top_n=30):
+        try:
+            tickers = self.exchange.fetch_tickers()
+            usdt_tickers = [
+                (symbol, tick['quoteVolume'])
+                for symbol, tick in tickers.items()
+                if symbol.endswith('/USDT')
+                and not (symbol.startswith('BTC/') and symbol != 'BTC/USDT') # Keep BTC/USDT, exclude other BTC pairs like BTC/DAI
+                and tick.get('quoteVolume', 0) is not None
+            ]
+            usdt_tickers.sort(key=lambda x: x[1], reverse=True)
+            top_symbols = [symbol for symbol, vol in usdt_tickers[:top_n]]
+            if not top_symbols: # Fallback if filtering is too aggressive
+                logger.warning("No top USDT symbols found with current criteria, falling back.")
+                return self._get_all_usdt_symbols(limit=top_n)
+            return top_symbols
+        except Exception as e:
+            logger.error(f"Failed to fetch top USDT symbols: {str(e)}")
+            return self._get_all_usdt_symbols(limit=top_n)
+
+    def _get_all_usdt_symbols(self, limit=30): # Added limit for fallback
+        try:
+            markets = self.exchange.load_markets()
+            usdt_symbols = [
+                symbol for symbol in markets
+                if symbol.endswith('/USDT')
+                and not (symbol.startswith('BTC/') and symbol != 'BTC/USDT')
+                and markets[symbol].get('active', False)
+            ]
+            return usdt_symbols[:limit] if usdt_symbols else ["BTC/USDT", "ETH/USDT"] # Ensure some symbols exist
+        except Exception as e:
+            logger.error(f"Failed to fetch all USDT symbols: {str(e)}")
+            return ["BTC/USDT", "ETH/USDT"] # Hardcoded fallback
+
+    def _load_config(self, config_file):
+        config = configparser.ConfigParser(inline_comment_prefixes='#')
+        if not os.path.exists(config_file):
+            logger.error(f"Config file not found: {config_file}")
+            raise FileNotFoundError(f"Config file not found: {config_file}")
+        config.read(config_file)
+        
+        try:
+            return {
+                'kucoin_api_key': config.get('DEFAULT', 'KUCOIN_API_KEY'),
+                'kucoin_api_secret': config.get('DEFAULT', 'KUCOIN_API_SECRET'),
+                'kucoin_api_passphrase': config.get('DEFAULT', 'KUCOIN_API_PASSPHRASE'),
+                'telegram_token': config.get('DEFAULT', 'TELEGRAM_BOT_TOKEN'),
+                'telegram_chat_id': config.get('DEFAULT', 'TELEGRAM_CHAT_ID')
+            }
+        except configparser.NoOptionError as e:
+            logger.error(f"Missing configuration parameter in {config_file}: {e}")
+            raise ValueError(f"Missing required configuration in {config_file}: {e}")
+
+    def _setup_exchange(self):
+        try:
+            exchange = ccxt.kucoin({
+                'apiKey': self.config['kucoin_api_key'],
+                'secret': self.config['kucoin_api_secret'],
+                'password': self.config['kucoin_api_passphrase'],
+                'enableRateLimit': True
+            })
+            logger.info("KuCoin exchange connection established")
+            return exchange
+        except Exception as e:
+            logger.error(f"Failed to set up KuCoin exchange: {str(e)}")
+            raise
+
+    def _setup_telegram(self):
+        try:
+            bot = telegram.Bot(token=self.config['telegram_token'])
+            logger.info("Telegram bot initialized")
+            return bot
+        except Exception as e:
+            logger.error(f"Failed to set up Telegram bot: {str(e)}")
+            raise
+          
+    def send_telegram_info(self, message):
+        """Send informational messages via Telegram."""
+        try:
+            self.telegram_bot.send_message(
+                chat_id=self.config['telegram_chat_id'],
+                text=message,
+                parse_mode=telegram.ParseMode.MARKDOWN # Assume markdown for info too
+            )
+            logger.info(f"Telegram info message sent: {message[:50]}...")
+        except Exception as e:
+            logger.error(f"Failed to send Telegram info message: {str(e)}")   
+                 
+    def load_price_history(self, symbol):
+        try:
+            filename = self.price_history_files[symbol]
+            if os.path.exists(filename):
+                with open(filename, 'r') as f:
+                    self.price_history[symbol] = json.load(f)
+                logger.info(f"Loaded price history for {symbol} with {len(self.price_history[symbol].get('swings', []))} swing records and {len(self.price_history[symbol].get('trade_results', []))} trade records.")
+            else:
+                self.price_history[symbol] = {"swings": [], "trade_results": []}
+                logger.info(f"Initialized new price history record for {symbol}")
+        except Exception as e:
+            logger.error(f"Error loading price history for {symbol}: {str(e)}")
+            self.price_history[symbol] = {"swings": [], "trade_results": []}
+
+    def save_price_history(self, symbol):
+        try:
+            filename = self.price_history_files[symbol]
+            with open(filename, 'w') as f:
+                json.dump(self.price_history[symbol], f, indent=4) # Added indent for readability
+            logger.info(f"Price history saved for {symbol}")
+        except Exception as e:
+            logger.error(f"Error saving price history for {symbol}: {str(e)}")
+
+    def update_price_history(self, df, symbol):
+        if df is None or df.empty:
+            logger.warning(f"DataFrame is empty for {symbol}, cannot update price history.")
+            return
+        try:
+            df_copy = df.copy() # Work on a copy
+            df_copy['is_local_high'] = False
+            df_copy['is_local_low'] = False
+            
+            window_size = 3
+            
+            for i in range(window_size, len(df_copy) - window_size):
+                if df_copy['high'].iloc[i] == df_copy['high'].iloc[i-window_size:i+window_size+1].max():
+                    df_copy.loc[df_copy.index[i], 'is_local_high'] = True
+                
+                if df_copy['low'].iloc[i] == df_copy['low'].iloc[i-window_size:i+window_size+1].min():
+                    df_copy.loc[df_copy.index[i], 'is_local_low'] = True
+            
+            highs = df_copy[df_copy['is_local_high']]
+            lows = df_copy[df_copy['is_local_low']]
+            
+            new_swings = []
+            for idx, row in highs.iterrows():
+                future_lows = lows[lows.index > idx]
+                if not future_lows.empty:
+                    next_low = future_lows.iloc[0]
+                    time_to_low = (next_low.name - idx).total_seconds() / 60
+                    price_change_pct = (next_low['low'] - row['high']) / row['high'] * 100
+                    if abs(price_change_pct) > 0.5:
+                        new_swings.append({
+                            "start_time": idx.strftime("%Y-%m-%d %H:%M:%S"), "end_time": next_low.name.strftime("%Y-%m-%d %H:%M:%S"),
+                            "start_price": float(row['high']), "end_price": float(next_low['low']), "direction": "down",
+                            "duration_minutes": time_to_low, "change_percent": float(price_change_pct)
+                        })
+            
+            for idx, row in lows.iterrows():
+                future_highs = highs[highs.index > idx]
+                if not future_highs.empty:
+                    next_high = future_highs.iloc[0]
+                    time_to_high = (next_high.name - idx).total_seconds() / 60
+                    price_change_pct = (next_high['high'] - row['low']) / row['low'] * 100
+                    if abs(price_change_pct) > 0.5:
+                        new_swings.append({
+                            "start_time": idx.strftime("%Y-%m-%d %H:%M:%S"), "end_time": next_high.name.strftime("%Y-%m-%d %H:%M:%S"),
+                            "start_price": float(row['low']), "end_price": float(next_high['high']), "direction": "up",
+                            "duration_minutes": time_to_high, "change_percent": float(price_change_pct)
+                        })
+            
+            if new_swings:
+                self.price_history[symbol]["swings"].extend(new_swings)
+                # Sort swings by start_time to maintain order if needed, and remove duplicates
+                self.price_history[symbol]["swings"] = sorted(self.price_history[symbol]["swings"], key=lambda x: x['start_time'])
+                # A more robust way to remove duplicates if start_time and direction are same:
+                unique_swings = []
+                seen_swings = set()
+                for swing in self.price_history[symbol]["swings"]:
+                    identifier = (swing['start_time'], swing['direction'])
+                    if identifier not in seen_swings:
+                        unique_swings.append(swing)
+                        seen_swings.add(identifier)
+                self.price_history[symbol]["swings"] = unique_swings
+
+            if len(self.price_history[symbol]["swings"]) > 1000:
+                self.price_history[symbol]["swings"] = self.price_history[symbol]["swings"][-1000:]
+            
+            self.save_price_history(symbol)
+        except Exception as e:
+            logger.error(f"Error updating price history for {symbol}: {str(e)}")
+          
+    def fetch_ohlcv_data(self, symbol, timeframe='1h', limit=100):
+        try:
+            # Ensure symbol is a string
+            if not isinstance(symbol, str):
+                logger.error(f"Invalid symbol type for fetch_ohlcv_data: {type(symbol)}. Expected str.")
+                # Attempt to recover if it's a DataFrame containing the symbol, or raise error
+                if hasattr(symbol, 'name') and isinstance(symbol.name, str): # Crude check
+                     symbol = symbol.name
+                else:
+                    raise ValueError(f"Invalid symbol argument: {symbol}")
+
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            if not ohlcv: # Check if ohlcv is empty
+                logger.warning(f"No OHLCV data returned for {symbol} on {timeframe}.")
+                return pd.DataFrame() # Return empty DataFrame
+
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            df.dropna(inplace=True)
+
+            logger.info(f"Fetched {len(df)} candlesticks for {symbol} on {timeframe}")
+            return df
+        except ccxt.BadSymbol:
+            logger.error(f"BadSymbol: Could not fetch OHLCV data for symbol '{symbol}' on {timeframe}. It might be an invalid symbol or delisted.")
+            return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"Error fetching OHLCV data for {symbol} on {timeframe}: {str(e)}")
+            return pd.DataFrame() # Return empty DataFrame on other errors
+        
+    def fetch_all_timeframes(self, symbol):
+        data = {}
+        for timeframe in self.timeframes: # Using self.timeframes ['1h', '4h', '1d']
+            df = self.fetch_ohlcv_data(symbol, timeframe=timeframe, limit=200) # Increased limit for more robust indicator calculation
+            if not df.empty:
+                df = self.calculate_indicators(df)
+                if not df.empty:
+                     data[timeframe] = df
+        return data
+
+    def calculate_indicators(self, df):
+        if df.empty:
+            return pd.DataFrame()
+            
+        data = df.copy()
+        # Ensure numeric data and no NaNs remain from initial columns
+        # The to_numeric in fetch_ohlcv_data should handle this mostly
+        # data = data.apply(pd.to_numeric, errors='coerce').dropna() # This was duplicated
+
+        data['ema_short'] = data['close'].ewm(span=self.short_window, adjust=False).mean()
+        data['ema_long'] = data['close'].ewm(span=self.long_window, adjust=False).mean()
+        
+        delta = data['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=self.rsi_period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=self.rsi_period).mean()
+        rs = gain / loss
+        data['rsi'] = 100 - (100 / (1 + rs))
+        
+        data['sma'] = data['close'].rolling(window=self.bollinger_period).mean()
+        data['std'] = data['close'].rolling(window=self.bollinger_period).std()
+        data['upper_band'] = data['sma'] + (data['std'] * self.bollinger_std)
+        data['lower_band'] = data['sma'] - (data['std'] * self.bollinger_std)
+        
+        data['ema_12'] = data['close'].ewm(span=12, adjust=False).mean()
+        data['ema_26'] = data['close'].ewm(span=26, adjust=False).mean()
+        data['macd'] = data['ema_12'] - data['ema_26']
+        data['macd_signal'] = data['macd'].ewm(span=9, adjust=False).mean()
+        data['macd_hist'] = data['macd'] - data['macd_signal']
+        
+        data['volume_ma'] = data['volume'].rolling(window=20).mean()
+        data['volume_change'] = (data['volume'] / data['volume_ma'] - 1) * 100
+        
+        k_period = 14
+        d_period = 3
+        low_min = data['low'].rolling(window=k_period).min()
+        high_max = data['high'].rolling(window=k_period).max()
+        data['stoch_k'] = 100 * ((data['close'] - low_min) / (high_max - low_min))
+        data['stoch_d'] = data['stoch_k'].rolling(window=d_period).mean()
+        
+        high_change = data['high'].diff()
+        low_change = -data['low'].diff() # low_change should be positive for downward moves
+        
+        plus_dm_series = ((high_change > low_change) & (high_change > 0)) * high_change
+        minus_dm_series = ((low_change > high_change) & (low_change > 0)) * low_change # This was low_change which is already -low.diff()
+                                                                              # For clarity: actual_low_diff = data['low'].diff(), minus_dm uses -actual_low_diff
+        
+        # Corrected DM calculation
+        df_temp = pd.DataFrame()
+        df_temp['high_diff'] = data['high'].diff()
+        df_temp['low_diff'] = data['low'].diff()
+
+        df_temp['plus_dm'] = 0.0
+        df_temp.loc[(df_temp['high_diff'] > -df_temp['low_diff']) & (df_temp['high_diff'] > 0), 'plus_dm'] = df_temp['high_diff']
+        
+        df_temp['minus_dm'] = 0.0
+        df_temp.loc[(-df_temp['low_diff'] > df_temp['high_diff']) & (-df_temp['low_diff'] > 0), 'minus_dm'] = -df_temp['low_diff']
+
+        tr1 = data['high'] - data['low']
+        tr2 = abs(data['high'] - data['close'].shift(1))
+        tr3 = abs(data['low'] - data['close'].shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        atr_period = 14
+        atr = tr.ewm(alpha=1/atr_period, adjust=False).mean() # Smoothed ATR (Wilder's) - common for ADX
+        # atr = tr.rolling(window=atr_period).mean() # Original was SMA
+
+        plus_di = 100 * (df_temp['plus_dm'].ewm(alpha=1/atr_period, adjust=False).mean() / atr)
+        minus_di = 100 * (df_temp['minus_dm'].ewm(alpha=1/atr_period, adjust=False).mean() / atr)
+        
+        # Handle division by zero for dx if (plus_di + minus_di) is zero
+        dx_denominator = (plus_di + minus_di)
+        dx = 100 * abs(plus_di - minus_di) / dx_denominator.where(dx_denominator != 0, np.nan) # Avoid division by zero
+        data['adx'] = dx.ewm(alpha=1/atr_period, adjust=False).mean() # Smoothed ADX
+        
+        data['obv'] = (np.sign(data['close'].diff()) * data['volume']).fillna(0).cumsum()
+        
+        data['atr'] = tr.rolling(window=14).mean() # Keep original ATR for TP/SL if preferred
+
+        return data.dropna() # Drop NaNs created by rolling windows at the start
+    
+    def simplified_indicator_signal(self, df):
+        if df is None or df.empty or len(df) < 2: # Need at least 2 rows for macd crossover
+            return 0
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        signal = 0
+
+        if 'rsi' in latest and latest['rsi'] < 25: signal += 1
+        elif 'rsi' in latest and latest['rsi'] > 75: signal -= 1
+
+        if 'macd' in latest and 'macd_signal' in latest and \
+           'macd' in prev and 'macd_signal' in prev:
+            if (latest['macd'] > latest['macd_signal']) and (prev['macd'] < prev['macd_signal']): signal += 1
+            elif (latest['macd'] < latest['macd_signal']) and (prev['macd'] > prev['macd_signal']): signal -= 1
+
+        if 'close' in latest and 'lower_band' in latest and latest['close'] < latest['lower_band']: signal += 1
+        elif 'close' in latest and 'upper_band' in latest and latest['close'] > latest['upper_band']: signal -= 1
+
+        if 'volume' in latest and 'volume_ma' in latest and latest['volume_ma'] > 0: # Avoid division by zero
+             if latest['volume'] > latest['volume_ma'] * 1.25: signal *= 2
+        
+        # Clamp signal to avoid extreme amplification
+        if signal >= 2: return 1
+        elif signal <= -2: return -1
+        else: return 0
+
+    def detect_price_patterns(self, df):
+        if df is None or df.empty or len(df) < 30: # Need enough data for patterns
+            return 0
+        signal = 0
+        close = df['close']
+
+        # Double top/bottom simplified
+        recent_highs = close[-10:].nlargest(2)
+        if len(recent_highs) == 2 and recent_highs.iloc[0] / recent_highs.iloc[1] < 1.005: # Tops are close
+            if close.iloc[-1] < recent_highs.mean() * 0.995: # Price fell below average of tops
+                signal = -1
+
+        recent_lows = close[-10:].nsmallest(2)
+        if len(recent_lows) == 2 and recent_lows.iloc[1] / recent_lows.iloc[0] < 1.005: # Lows are close
+            if close.iloc[-1] > recent_lows.mean() * 1.005: # Price rose above average of lows
+                signal = 1
+        
+        # Breakout from 30-period high/low
+        # Ensure we are not in the last candle of the 30-period window to confirm breakout
+        if len(close) > 30:
+            resistance = close[-31:-1].max() # Resistance from previous 30 candles
+            if close.iloc[-1] > resistance:
+                signal = 1 
+            
+            support = close[-31:-1].min() # Support from previous 30 candles
+            if close.iloc[-1] < support:
+                signal = -1
+        return signal
+
+    def calculate_dynamic_tp_sl(self, df, entry_price, direction):
+        if df is None or df.empty or 'atr' not in df.columns or df['atr'].isnull().all():
+            logger.warning("ATR not available for dynamic TP/SL, using default percentages.")
+            sl_pct = self.default_stop_loss_pct / 100
+            tp_pct = self.default_take_profit_pct / 100
+            if direction == 1: # Long
+                SL = entry_price * (1 - sl_pct)
+                TP1 = entry_price * (1 + tp_pct)
+                TP2 = entry_price * (1 + tp_pct * 1.5) # Example scaling
+                TP3 = entry_price * (1 + tp_pct * 2.0) # Example scaling
+            else: # Short
+                SL = entry_price * (1 + sl_pct)
+                TP1 = entry_price * (1 - tp_pct)
+                TP2 = entry_price * (1 - tp_pct * 1.5)
+                TP3 = entry_price * (1 - tp_pct * 2.0)
+            return round(TP1, 4), round(TP2, 4), round(TP3, 4), round(SL, 4)
+
+        atr = df['atr'].iloc[-1]
+        if atr == 0: atr = entry_price * 0.01 # Safety for zero ATR
+
+        if direction == 1: # Long
+            TP1 = entry_price + (atr * 1.5)
+            TP2 = entry_price + (atr * 2.5)
+            TP3 = entry_price + (atr * 4.0)
+            SL = entry_price - (atr * 1.0)
+        else: # Short
+            TP1 = entry_price - (atr * 1.5)
+            TP2 = entry_price - (atr * 2.5)
+            TP3 = entry_price - (atr * 4.0)
+            SL = entry_price + (atr * 1.0)
+        return round(TP1, 4), round(TP2, 4), round(TP3, 4), round(SL, 4)
+    
+    def generate_final_trade_signal(self, symbol: str):
+        """ Generates a trade signal based on multi-timeframe analysis. Expects a symbol string. """
+        data_all_tf = self.fetch_all_timeframes(symbol) # data_all_tf is a dict of DFs {timeframe: df}
+
+        if not data_all_tf:
+            logger.warning(f"No data fetched by fetch_all_timeframes for {symbol}. Cannot generate signal.")
+            return None
+
+        timeframe_signals = []
+        for tf_name, df_tf in data_all_tf.items():
+            if df_tf.empty:
+                logger.warning(f"Empty dataframe for {symbol} on timeframe {tf_name}, skipping this timeframe for signal.")
+                continue
+            indicator_signal = self.simplified_indicator_signal(df_tf)
+            pattern_signal = self.detect_price_patterns(df_tf)
+            total_tf_signal = indicator_signal + pattern_signal
+            timeframe_signals.append(total_tf_signal)
+
+        if not timeframe_signals: # No valid timeframe data processed
+            logger.warning(f"No valid timeframe data to process for signals for {symbol}.")
+            return None
+            
+        signal_sum = sum(timeframe_signals)
+        direction = 0
+        if signal_sum >= 2: direction = 1
+        elif signal_sum <= -2: direction = -1
+        else: return None # No strong consensus
+
+        # Use the primary timeframe (e.g., '1h') for entry price and dynamic TP/SL calculation
+        primary_tf_df = data_all_tf.get(self.default_ohlcv_timeframe)
+        if primary_tf_df is None or primary_tf_df.empty:
+            logger.warning(f"Primary timeframe {self.default_ohlcv_timeframe} data not available for {symbol} to finalize signal.")
+            # Fallback to first available timeframe if primary is missing
+            available_tfs = list(data_all_tf.keys())
+            if not available_tfs: return None
+            primary_tf_df = data_all_tf[available_tfs[0]]
+            if primary_tf_df is None or primary_tf_df.empty: return None
+            logger.info(f"Using {available_tfs[0]} data for entry/TP/SL for {symbol} as primary was unavailable.")
+
+
+        entry_price = primary_tf_df['close'].iloc[-1]
+        TP1, TP2, TP3, SL = self.calculate_dynamic_tp_sl(primary_tf_df, entry_price, direction)
+
+        return {
+            'symbol': symbol,
+            'direction': 'Long' if direction == 1 else 'Short',
+            'entry_price': entry_price,
+            'TP1': TP1, 'TP2': TP2, 'TP3': TP3, 'SL': SL
+        }
+
+    def get_market_context(self, df, symbol):
+        if df is None or df.empty or len(df) < 2: # Need at least 2 for diff()
+            return {
+                "symbol": symbol, "price": np.nan, "price_change_24h": 0, "volatility": 0,
+                "rsi": np.nan, "trend": "N/A", "bollinger_position": "N/A"
+            }
+        last_row = df.iloc[-1]
+        price = last_row['close']
+        
+        # Assuming df is 1h data for this context call based on self.default_ohlcv_timeframe
+        candles_for_24h = 24 
+        if len(df) >= candles_for_24h:
+            price_24h_ago = df.iloc[-candles_for_24h]['close']
+            price_change_24h = ((price - price_24h_ago) / price_24h_ago) * 100 if price_24h_ago != 0 else 0
+        else:
+            price_change_24h = 0
+        
+        atr = df['atr'].iloc[-1] if 'atr' in df.columns and not df['atr'].empty else 0
+        volatility = (atr / price) * 100 if price != 0 else 0
+        
+        rsi = last_row['rsi'] if 'rsi' in last_row else np.nan
+        
+        trend = "N/A"
+        if 'ema_short' in last_row and 'ema_long' in last_row:
+            if last_row['ema_short'] > last_row['ema_long']: trend = "Bullish"
+            else: trend = "Bearish"
+        
+        bb_position = "N/A"
+        if 'upper_band' in last_row and 'lower_band' in last_row:
+            if price > last_row['upper_band']: bb_position = "Above upper band"
+            elif price < last_row['lower_band']: bb_position = "Below lower band"
+            else: bb_position = "Between bands"
+        
+        return {
+            "symbol": symbol, "price": price, "price_change_24h": price_change_24h,
+            "volatility": volatility, "rsi": rsi, "trend": trend, "bollinger_position": bb_position
+        }
+
+    def backtest_strategy(self, symbol, days=7):
+        default_timeframe_for_backtest = self.default_ohlcv_timeframe
+        candles_needed = int((days * 24 * 60) / self._timeframe_to_minutes(default_timeframe_for_backtest)) + 50 # Add buffer for indicator warmup
+        
+        try:
+            df_hist = self.fetch_ohlcv_data(symbol, timeframe=default_timeframe_for_backtest, limit=candles_needed)
+            if df_hist.empty or len(df_hist) < 60: # Need sufficient data
+                logger.warning(f"Not enough historical data for backtesting {symbol} ({len(df_hist)} candles).")
+                return {'symbol': symbol, 'period': f"{days} days", 'total_trades': 0, 'message': 'Not enough historical data'}, []
+
+            df_with_indicators = self.calculate_indicators(df_hist)
+            if df_with_indicators.empty:
+                 logger.warning(f"Not enough data after indicator calculation for backtesting {symbol}.")
+                 return {'symbol': symbol, 'period': f"{days} days", 'total_trades': 0, 'message': 'Not enough data post-indicators'}, []
+
+            self.update_price_history(df_with_indicators, symbol) # Learn from this data
+            
+            signals_list = []
+            min_rows_for_signal_logic = 30 # For detect_price_patterns primarily
+            for i in range(len(df_with_indicators)):
+                if i < min_rows_for_signal_logic -1 : # Ensure enough lookback for pattern detection
+                    signals_list.append(0)
+                    continue
+                
+                current_df_slice = df_with_indicators.iloc[:i+1]
+                indicator_signal_val = self.simplified_indicator_signal(current_df_slice)
+                pattern_signal_val = self.detect_price_patterns(current_df_slice)
+                total_signal = indicator_signal_val + pattern_signal_val
+                
+                final_signal = 0
+                if total_signal >= 2: final_signal = 1
+                elif total_signal <= -2: final_signal = -1
+                signals_list.append(final_signal)
+
+            df_with_indicators['signal'] = signals_list
+            # df_with_signals is now df_with_indicators with a 'signal' column
+            df_backtest = df_with_indicators.copy()
+
+
+            initial_balance = 1000
+            balance = initial_balance
+            position = 0  # 0 = no position, 1 = long, -1 = short
+            entry_price = 0
+            entry_time = None
+            trades = []
+            
+            # Store SL/TP for current trade
+            current_sl = 0
+            current_tp = 0
+
+            for i in range(1, len(df_backtest)): # Start from 1 to use previous row if needed
+                signal = df_backtest['signal'].iloc[i]
+                price = df_backtest['close'].iloc[i]
+                current_candle_time = df_backtest.index[i]
+
+                # Check SL/TP for existing positions
+                if position == 1: # Long position
+                    if price <= current_sl: # Stop Loss Hit
+                        position = 0
+                        profit_pct = (current_sl - entry_price) / entry_price * 100
+                        balance += balance * (profit_pct / 100)
+                        trades.append({'entry_time': entry_time, 'entry_price': entry_price, 'exit_time': current_candle_time, 'exit_price': current_sl, 'profit_pct': profit_pct, 'status': 'SL'})
+                    elif price >= current_tp: # Take Profit Hit
+                        position = 0
+                        profit_pct = (current_tp - entry_price) / entry_price * 100
+                        balance += balance * (profit_pct / 100)
+                        trades.append({'entry_time': entry_time, 'entry_price': entry_price, 'exit_time': current_candle_time, 'exit_price': current_tp, 'profit_pct': profit_pct, 'status': 'TP'})
+                elif position == -1: # Short position
+                    if price >= current_sl: # Stop Loss Hit
+                        position = 0
+                        profit_pct = (entry_price - current_sl) / entry_price * 100
+                        balance += balance * (profit_pct / 100)
+                        trades.append({'entry_time': entry_time, 'entry_price': entry_price, 'exit_time': current_candle_time, 'exit_price': current_sl, 'profit_pct': profit_pct, 'status': 'SL'})
+                    elif price <= current_tp: # Take Profit Hit
+                        position = 0
+                        profit_pct = (entry_price - current_tp) / entry_price * 100
+                        balance += balance * (profit_pct / 100)
+                        trades.append({'entry_time': entry_time, 'entry_price': entry_price, 'exit_time': current_candle_time, 'exit_price': current_tp, 'profit_pct': profit_pct, 'status': 'TP'})
+
+                # Check for new entry signals if no active position
+                if position == 0:
+                    if signal == 1:  # Buy signal
+                        position = 1
+                        entry_price = price
+                        entry_time = current_candle_time
+                        # Use the df_backtest slice up to current point for ATR calculation context
+                        tp1, _, _, sl = self.calculate_dynamic_tp_sl(df_backtest.iloc[:i+1], entry_price, 1)
+                        current_sl = sl
+                        current_tp = tp1 
+                    elif signal == -1: # Sell signal
+                        position = -1
+                        entry_price = price
+                        entry_time = current_candle_time
+                        tp1, _, _, sl = self.calculate_dynamic_tp_sl(df_backtest.iloc[:i+1], entry_price, -1)
+                        current_sl = sl
+                        current_tp = tp1
+            
+            # If position is still open at the end, close it at last price
+            if position != 0:
+                exit_price = df_backtest['close'].iloc[-1]
+                if position == 1: profit_pct = (exit_price - entry_price) / entry_price * 100
+                else: profit_pct = (entry_price - exit_price) / entry_price * 100
+                balance += balance * (profit_pct/100)
+                trades.append({'entry_time': entry_time, 'entry_price': entry_price, 'exit_time': df_backtest.index[-1], 'exit_price': exit_price, 'profit_pct': profit_pct, 'status': 'ClosedAtEnd'})
+
+            # Update price_history with trade results from backtest
+            for trade in trades:
+                 trade_result_entry = {
+                    'entry_time': trade['entry_time'].strftime("%Y-%m-%d %H:%M:%S"),
+                    'entry_price': float(trade['entry_price']),
+                    'exit_time': trade['exit_time'].strftime("%Y-%m-%d %H:%M:%S"),
+                    'exit_price': float(trade['exit_price']),
+                    'profit_pct': float(trade['profit_pct']),
+                    'profit_amount': (trade['profit_pct']/100) * initial_balance, # Simplified profit amount
+                    'duration_minutes': (trade['exit_time'] - trade['entry_time']).total_seconds() / 60,
+                    'stop_loss_used': float(current_sl if trade['status'] == 'SL' else np.nan), # Example values
+                    'take_profit_used': float(current_tp if trade['status'] == 'TP' else np.nan), # Example values
+                    'signal_type': 'buy' if trade['entry_price'] < trade['exit_price'] and trade['status'] != 'SL' else 'sell', # Approximation
+                    'exit_reason': trade['status']
+                }
+                 self.price_history[symbol]['trade_results'].append(trade_result_entry)
+
+            if len(self.price_history[symbol]['trade_results']) > 200:
+                self.price_history[symbol]['trade_results'] = self.price_history[symbol]['trade_results'][-200:]
+            self.save_price_history(symbol)
+            
+            total_trades = len(trades)
+            winning_trades = sum(1 for trade in trades if trade['profit_pct'] > 0)
+            
+            if total_trades > 0:
+                win_rate = (winning_trades / total_trades) * 100
+                avg_profit = sum(trade['profit_pct'] for trade in trades) / total_trades
+                max_profit = max((trade['profit_pct'] for trade in trades), default=0)
+                max_loss = min((trade['profit_pct'] for trade in trades), default=0)
+                sl_hits = sum(1 for trade in trades if trade['status'] == 'SL')
+                tp_hits = sum(1 for trade in trades if trade['status'] == 'TP')
+                sl_rate = (sl_hits / total_trades) * 100
+                tp_rate = (tp_hits / total_trades) * 100
+                total_return = ((balance - initial_balance) / initial_balance) * 100
+                
+                report = {
+                    'symbol': symbol, 'period': f"{days} days", 'total_trades': total_trades,
+                    'win_rate': win_rate, 'avg_profit': avg_profit, 'max_profit': max_profit,
+                    'max_loss': max_loss, 'stop_loss_hit_rate': sl_rate, 
+                    'take_profit_hit_rate': tp_rate, 'total_return': total_return, 'final_balance': balance
+                }
+                return report, trades
+            else:
+                return {'symbol': symbol, 'period': f"{days} days", 'total_trades': 0, 'message': 'No trades executed'}, []
+                
+        except Exception as e:
+            logger.error(f"Error during backtesting {symbol}: {str(e)}", exc_info=True)
+            return {'symbol': symbol, 'error': str(e)}, []
+
+    def _timeframe_to_minutes(self, timeframe):
+        if not timeframe or not isinstance(timeframe, str) or len(timeframe) < 2:
+            return 15 # Default for safety
+        unit = timeframe[-1]
+        try:
+            value = int(timeframe[:-1])
+        except ValueError:
+            return 15 # Default if timeframe number is invalid
+
+        if unit == 'm': return value
+        elif unit == 'h': return value * 60
+        elif unit == 'd': return value * 60 * 24
+        else: return 15
+
+    def run_bot(self, interval=60, backtest_days=None):
+        if backtest_days:
+            for symbol in self.symbols:
+                logger.info(f"Running backtest for {symbol} for {backtest_days} days...")
+                report, trades = self.backtest_strategy(symbol, days=backtest_days)
+                
+                if 'error' not in report:
+                    report_message = f"""🧪 *Backtest Results for {symbol}* 🧪
+*Period:* {report['period']}
+*Total Trades:* {report['total_trades']}
+*Win Rate:* {report.get('win_rate', 'N/A'):.2f}%
+*Avg Profit per Trade:* {report.get('avg_profit', 'N/A'):.2f}%
+*Max Profit:* {report.get('max_profit', 'N/A'):.2f}%
+*Max Loss:* {report.get('max_loss', 'N/A'):.2f}%
+*Stop Loss Hit Rate:* {report.get('stop_loss_hit_rate', 'N/A'):.2f}%
+*Take Profit Hit Rate:* {report.get('take_profit_hit_rate', 'N/A'):.2f}%
+*Total Return:* {report.get('total_return', 'N/A'):.2f}%
+*Starting Balance:* $1000
+*Final Balance:* ${report.get('final_balance', 'N/A'):.2f}"""
+                    self.send_telegram_info(report_message) # Use send_telegram_info
+                    
+                    if trades:
+                        recent_trades = trades[-5:]
+                        trades_message = f"*Recent Trades for {symbol} ({len(trades)} total):*\n"
+                        for trade in recent_trades:
+                            trades_message += (f"Entry: {trade['entry_time'].strftime('%Y-%m-%d %H:%M')} at ${trade['entry_price']:.4f}, "
+                                               f"Exit: {trade['exit_time'].strftime('%Y-%m-%d %H:%M')} at ${trade['exit_price']:.4f}, "
+                                               f"P/L: {trade['profit_pct']:.2f}%, Status: {trade['status']}\n")
+                        self.send_telegram_info(trades_message) # Use send_telegram_info
+                else:
+                    self.send_telegram_info(f"❌ Backtest Failed for {symbol}: {report['error']}")
+        
+        logger.info(f"Starting real-time monitoring of symbols: {', '.join(self.symbols)}")
+        self.send_telegram_info(f"▶️ *Real-time Monitoring Started*\nMonitoring symbols: {', '.join(self.symbols)} on {self.timeframes} timeframes using {self.default_ohlcv_timeframe} primary.")
+        
+        min_rows_for_context = 30 # For indicators and patterns
+        resend_signal_threshold_seconds = 30 * 60 # 30 minutes
+
+        try:
+            while True:
+                try:
+                    for symbol in self.symbols:
+                        # Fetch data for main timeframe (e.g., 1h for context, current price)
+                        df_main_tf = self.fetch_ohlcv_data(symbol, timeframe=self.default_ohlcv_timeframe, limit=100)
+                        if df_main_tf.empty or len(df_main_tf) < min_rows_for_context:
+                            logger.warning(f"Not enough {self.default_ohlcv_timeframe} data for {symbol} in run_bot ({len(df_main_tf)} candles). Skipping cycle for this symbol.")
+                            continue
+                        
+                        df_with_indicators = self.calculate_indicators(df_main_tf)
+                        if df_with_indicators.empty:
+                            logger.warning(f"Not enough data after indicator calculation for {symbol} on {self.default_ohlcv_timeframe}. Skipping.")
+                            continue
+                        
+                        self.update_price_history(df_with_indicators, symbol)
+                        
+                        latest_indicator_data = df_with_indicators.iloc[-1]
+                        current_price = latest_indicator_data['close']
+                        current_time = datetime.now()
+
+                        # Check active trades for SL/TP
+                        for trade in list(self.active_trades[symbol]): # Iterate over a copy for safe removal
+                            trade_hit = False
+                            exit_reason = None
+                            profit_pct = 0
+
+                            if (trade['signal_type'] == 1 and current_price <= trade['stop_loss']) or \
+                               (trade['signal_type'] == -1 and current_price >= trade['stop_loss']):
+                                profit_pct = ((current_price - trade['entry_price']) / trade['entry_price'] * 100) if trade['signal_type'] == 1 else ((trade['entry_price'] - current_price) / trade['entry_price'] * 100)
+                                msg_link = self.get_telegram_message_link(trade.get('signal_chat_id'), trade.get('signal_msg_id')) if trade.get('signal_msg_id') else ""
+                                link_text = f"\n[🔗 Original Signal]({msg_link})" if msg_link else ""
+                                sl_message = f"⛔ *STOP LOSS HIT* ⛔\n*{symbol}* at {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n*Entry:* ${trade['entry_price']:.4f} ({'BUY' if trade['signal_type'] == 1 else 'SELL'})\n*SL Price:* ${current_price:.4f} (Hit SL @ ${trade['stop_loss']:.4f})\n*P/L:* {profit_pct:.2f}%{link_text}"
+                                self.send_telegram_info(sl_message)
+                                trade_hit = True
+                                exit_reason = 'stop_loss'
+                            
+                            elif (trade['signal_type'] == 1 and current_price >= trade['take_profit']) or \
+                                 (trade['signal_type'] == -1 and current_price <= trade['take_profit']):
+                                profit_pct = ((current_price - trade['entry_price']) / trade['entry_price'] * 100) if trade['signal_type'] == 1 else ((trade['entry_price'] - current_price) / trade['entry_price'] * 100)
+                                msg_link = self.get_telegram_message_link(trade.get('signal_chat_id'), trade.get('signal_msg_id')) if trade.get('signal_msg_id') else ""
+                                link_text = f"\n[🔗 Original Signal]({msg_link})" if msg_link else ""
+                                tp_message = f"💰 *TAKE PROFIT HIT* 💰\n*{symbol}* at {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n*Entry:* ${trade['entry_price']:.4f} ({'BUY' if trade['signal_type'] == 1 else 'SELL'})\n*TP Price:* ${current_price:.4f} (Hit TP @ ${trade['take_profit']:.4f})\n*Profit:* {profit_pct:.2f}%{link_text}"
+                                self.send_telegram_info(tp_message)
+                                self.successful_signals[symbol] += 1
+                                trade_hit = True
+                                exit_reason = 'take_profit'
+
+                            if trade_hit:
+                                trade_result = {
+                                    'entry_time': trade['entry_time'].strftime("%Y-%m-%d %H:%M:%S"), 'entry_price': float(trade['entry_price']),
+                                    'exit_time': current_time.strftime("%Y-%m-%d %H:%M:%S"), 'exit_price': float(current_price),
+                                    'profit_pct': float(profit_pct), 'exit_reason': exit_reason,
+                                    'signal_type': 'buy' if trade['signal_type'] == 1 else 'sell',
+                                    'duration_minutes': ((current_time - trade['entry_time']).total_seconds() / 60),
+                                    'predicted_time': trade.get('time_to_profit', 0) # Use .get for safety
+                                }
+                                self.price_history[symbol]['trade_results'].append(trade_result)
+                                self.active_trades[symbol].remove(trade)
+                                self.save_price_history(symbol) # Save after each closed trade
+                                continue # Move to next active trade or out of loop
+
+                            # Trade time alert
+                            expected_duration_minutes = trade.get('time_to_profit', 60) # Default to 60 mins if not set
+                            if (current_time - trade['entry_time']).total_seconds() / 60 > expected_duration_minutes * 2 and not trade.get('time_alert_sent'):
+                                current_pnl = ((current_price - trade['entry_price']) / trade['entry_price'] * 100 if trade['signal_type'] == 1 else (trade['entry_price'] - current_price) / trade['entry_price'] * 100)
+                                reminder_message = f"⏰ *TRADE TIME ALERT* ⏰\n*{symbol}* trade has exceeded 2x expected time.\n*Entry:* ${trade['entry_price']:.4f} ({'BUY' if trade['signal_type'] == 1 else 'SELL'})\n*Current P/L:* {current_pnl:.2f}%\n*Expected Duration:* {expected_duration_minutes} mins."
+                                self.send_telegram_info(reminder_message)
+                                trade['time_alert_sent'] = True # Mark that alert was sent
+
+                        # Generate new trade signal using multi-timeframe logic
+                        trade_signal_details = self.generate_final_trade_signal(symbol)
+
+                        if trade_signal_details:
+                            signal_dir_str = trade_signal_details['direction']
+                            current_signal_numeric = 1 if signal_dir_str == 'Long' else -1
+                            time_since_last_signal = (current_time - self.last_signal_time[symbol]).total_seconds() if self.last_signal_time[symbol] else float('inf')
+
+                            if self.last_signal_direction[symbol] != current_signal_numeric or time_since_last_signal > resend_signal_threshold_seconds:
+                                market_context = self.get_market_context(df_with_indicators, symbol)
+                                
+                                signal_message_text = (
+                                    f"📈 {signal_dir_str} {symbol} 🚀\n\n"
+                                    f"Entry Price: {trade_signal_details['entry_price']:.4f}\n\n"
+                                    f"🎯 TP Targets:\n"
+                                    f"1️⃣ TP1: {trade_signal_details['TP1']:.4f}\n"
+                                    f"2️⃣ TP2: {trade_signal_details['TP2']:.4f}\n"
+                                    f"3️⃣ TP3: {trade_signal_details['TP3']:.4f}\n\n"
+                                    f"🛑 Stop Loss: {trade_signal_details['SL']:.4f}\n\n"
+                                    f"📊 Market Context ({self.default_ohlcv_timeframe}):\n"
+                                    f"   Price: ${market_context['price']:.4f}\n   24h Change: {market_context['price_change_24h']:.2f}%\n"
+                                    f"   Volatility (ATR%): {market_context['volatility']:.2f}%\n   RSI: {market_context['rsi']:.2f}\n"
+                                    f"   Trend (EMA): {market_context['trend']}\n   BB Position: {market_context['bollinger_position']}\n\n"
+                                    f"Confidence: 🔥🔥🔥 (multi-timeframe alignment)"
+                                )
+                                if self.last_signal_time[symbol] is not None and self.last_signal_direction[symbol] != current_signal_numeric:
+                                    old_dir = 'Long' if self.last_signal_direction[symbol] == 1 else 'Short'
+                                    signal_message_text += f"\n\n⚠️ *Signal Direction Changed* from {old_dir} to {signal_dir_str}"
+                                
+                                sent_telegram_obj = self.send_signal_message(signal_message_text)
+                                msg_id, chat_id = (sent_telegram_obj.message_id, sent_telegram_obj.chat.id) if sent_telegram_obj else (None, None)
+
+                                estimated_time_to_profit_active = 60 # Placeholder for active trades, can be refined
+                                new_trade = {
+                                    'entry_time': current_time, 'entry_price': trade_signal_details['entry_price'],
+                                    'signal_type': current_signal_numeric, 'stop_loss': trade_signal_details['SL'],
+                                    'take_profit': trade_signal_details['TP1'], # Manage against TP1 initially
+                                    'tp2': trade_signal_details['TP2'], 'tp3': trade_signal_details['TP3'],
+                                    'time_to_profit': estimated_time_to_profit_active,
+                                    'signal_msg_id': msg_id, 'signal_chat_id': chat_id, 'time_alert_sent': False
+                                }
+                                self.active_trades[symbol].append(new_trade)
+                                self.last_signal_time[symbol] = current_time
+                                self.last_signal_direction[symbol] = current_signal_numeric
+                                self.signals_generated[symbol] += 1
+                                logger.info(f"{symbol} - Signal: {signal_dir_str} sent. Entry: {trade_signal_details['entry_price']:.4f}, SL: {trade_signal_details['SL']:.4f}, TP1: {trade_signal_details['TP1']:.4f}")
+                            else:
+                                logger.info(f"{symbol} - Signal ({signal_dir_str}) for {symbol} is same as last or too recent. Not sending.")
+                        
+                        # Periodically save history if many trades accumulate (though save on close is better)
+                        if len(self.price_history[symbol]['trade_results']) % 10 == 0 and len(self.price_history[symbol]['trade_results']) > 0 : # e.g. every 10 trades
+                            if len(self.price_history[symbol]['trade_results']) > 200:
+                                self.price_history[symbol]['trade_results'] = self.price_history[symbol]['trade_results'][-200:]
+                            self.save_price_history(symbol)
+                
+                    time.sleep(interval)
+                
+                except ccxt.NetworkError as e:
+                    logger.error(f"Network error in monitoring loop: {str(e)}. Retrying after {interval}s.")
+                    self.send_telegram_info(f"⚠️ *Warning:* Network error: {str(e)}. Bot continues...")
+                    time.sleep(interval)
+                except ccxt.ExchangeError as e:
+                    logger.error(f"Exchange error in monitoring loop: {str(e)}. Retrying after {interval}s.")
+                    self.send_telegram_info(f"⚠️ *Warning:* Exchange error: {str(e)}. Bot continues...")
+                    time.sleep(interval)
+                except Exception as e:
+                    logger.error(f"Error in monitoring loop: {str(e)}", exc_info=True)
+                    self.send_telegram_info(f"⚠️ *Warning:* General error in monitoring loop: {str(e)}. Bot continues...")
+                    time.sleep(interval * 2) # Longer sleep for unexpected general errors
+                    
+        except KeyboardInterrupt:
+            logger.info("Bot stopping due to KeyboardInterrupt...")
+            self.send_telegram_info("🛑 *Bot Stopped*\nThe trading bot was manually stopped.")
+        finally:
+            logger.info("Saving all price histories before full exit...")
+            for symbol_to_save in self.symbols:
+                if self.price_history.get(symbol_to_save): # Ensure it exists
+                    self.save_price_history(symbol_to_save)
+            logger.info("All price histories saved. Bot shutdown complete.")
+
+
+if __name__ == "__main__":
+    bot = KuCoinSwingBot()
+    bot.run_bot(interval=60, backtest_days=7)
