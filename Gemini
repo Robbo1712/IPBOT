@@ -747,42 +747,50 @@ class KuCoinSwingBot:
                 report, trades = self.backtest_strategy(symbol, days=backtest_days)
                 
                 if 'error' not in report:
+                    # Helper function to format numbers or return the default string
+                    def format_value(value, format_spec=":.2f"):
+                        if isinstance(value, (int, float)):
+                            try:
+                                return f"{float(value):{format_spec}}" # Ensure it's float before formatting
+                            except (ValueError, TypeError):
+                                return str(value) # Fallback if conversion fails
+                        return str(value) # Return 'N/A' or other string as is
+
                     report_message = f"""🧪 *Backtest Results for {symbol}* 🧪
-*Period:* {report['period']}
-*Total Trades:* {report['total_trades']}
-*Win Rate:* {report.get('win_rate', 'N/A'):.2f}%
-*Avg Profit per Trade:* {report.get('avg_profit', 'N/A'):.2f}%
-*Max Profit:* {report.get('max_profit', 'N/A'):.2f}%
-*Max Loss:* {report.get('max_loss', 'N/A'):.2f}%
-*Stop Loss Hit Rate:* {report.get('stop_loss_hit_rate', 'N/A'):.2f}%
-*Take Profit Hit Rate:* {report.get('take_profit_hit_rate', 'N/A'):.2f}%
-*Total Return:* {report.get('total_return', 'N/A'):.2f}%
+*Period:* {report.get('period', 'N/A')}
+*Total Trades:* {report.get('total_trades', 'N/A')}
+*Win Rate:* {format_value(report.get('win_rate', 'N/A'))}%
+*Avg Profit per Trade:* {format_value(report.get('avg_profit', 'N/A'))}%
+*Max Profit:* {format_value(report.get('max_profit', 'N/A'))}%
+*Max Loss:* {format_value(report.get('max_loss', 'N/A'))}%
+*Stop Loss Hit Rate:* {format_value(report.get('stop_loss_hit_rate', 'N/A'))}%
+*Take Profit Hit Rate:* {format_value(report.get('take_profit_hit_rate', 'N/A'))}%
+*Total Return:* {format_value(report.get('total_return', 'N/A'))}%
 *Starting Balance:* $1000
-*Final Balance:* ${report.get('final_balance', 'N/A'):.2f}"""
-                    self.send_telegram_info(report_message) # Use send_telegram_info
+*Final Balance:* ${format_value(report.get('final_balance', 'N/A'))}"""
+                    self.send_telegram_info(report_message)
                     
                     if trades:
                         recent_trades = trades[-5:]
                         trades_message = f"*Recent Trades for {symbol} ({len(trades)} total):*\n"
                         for trade in recent_trades:
-                            trades_message += (f"Entry: {trade['entry_time'].strftime('%Y-%m-%d %H:%M')} at ${trade['entry_price']:.4f}, "
-                                               f"Exit: {trade['exit_time'].strftime('%Y-%m-%d %H:%M')} at ${trade['exit_price']:.4f}, "
-                                               f"P/L: {trade['profit_pct']:.2f}%, Status: {trade['status']}\n")
-                        self.send_telegram_info(trades_message) # Use send_telegram_info
+                            trades_message += (f"Entry: {trade['entry_time'].strftime('%Y-%m-%d %H:%M')} at ${format_value(trade.get('entry_price', 'N/A'), '.4f')}, "
+                                               f"Exit: {trade['exit_time'].strftime('%Y-%m-%d %H:%M')} at ${format_value(trade.get('exit_price', 'N/A'), '.4f')}, "
+                                               f"P/L: {format_value(trade.get('profit_pct', 'N/A'), '.2f')}%, Status: {trade.get('status', 'N/A')}\n")
+                        self.send_telegram_info(trades_message)
                 else:
                     self.send_telegram_info(f"❌ Backtest Failed for {symbol}: {report['error']}")
         
         logger.info(f"Starting real-time monitoring of symbols: {', '.join(self.symbols)}")
         self.send_telegram_info(f"▶️ *Real-time Monitoring Started*\nMonitoring symbols: {', '.join(self.symbols)} on {self.timeframes} timeframes using {self.default_ohlcv_timeframe} primary.")
         
-        min_rows_for_context = 30 # For indicators and patterns
-        resend_signal_threshold_seconds = 30 * 60 # 30 minutes
+        min_rows_for_context = 30 
+        resend_signal_threshold_seconds = 30 * 60 
 
         try:
             while True:
                 try:
                     for symbol in self.symbols:
-                        # Fetch data for main timeframe (e.g., 1h for context, current price)
                         df_main_tf = self.fetch_ohlcv_data(symbol, timeframe=self.default_ohlcv_timeframe, limit=100)
                         if df_main_tf.empty or len(df_main_tf) < min_rows_for_context:
                             logger.warning(f"Not enough {self.default_ohlcv_timeframe} data for {symbol} in run_bot ({len(df_main_tf)} candles). Skipping cycle for this symbol.")
@@ -799,28 +807,34 @@ class KuCoinSwingBot:
                         current_price = latest_indicator_data['close']
                         current_time = datetime.now()
 
-                        # Check active trades for SL/TP
-                        for trade in list(self.active_trades[symbol]): # Iterate over a copy for safe removal
+                        for trade in list(self.active_trades[symbol]): 
                             trade_hit = False
                             exit_reason = None
-                            profit_pct = 0
+                            profit_pct = 0.0 # Initialize as float
 
-                            if (trade['signal_type'] == 1 and current_price <= trade['stop_loss']) or \
-                               (trade['signal_type'] == -1 and current_price >= trade['stop_loss']):
-                                profit_pct = ((current_price - trade['entry_price']) / trade['entry_price'] * 100) if trade['signal_type'] == 1 else ((trade['entry_price'] - current_price) / trade['entry_price'] * 100)
+                            # Ensure all price points are float for calculations
+                            trade_entry_price_float = float(trade['entry_price'])
+                            current_price_float = float(current_price)
+                            trade_stop_loss_float = float(trade['stop_loss'])
+                            trade_take_profit_float = float(trade['take_profit'])
+
+
+                            if (trade['signal_type'] == 1 and current_price_float <= trade_stop_loss_float) or \
+                               (trade['signal_type'] == -1 and current_price_float >= trade_stop_loss_float):
+                                profit_pct = ((current_price_float - trade_entry_price_float) / trade_entry_price_float * 100) if trade['signal_type'] == 1 else ((trade_entry_price_float - current_price_float) / trade_entry_price_float * 100)
                                 msg_link = self.get_telegram_message_link(trade.get('signal_chat_id'), trade.get('signal_msg_id')) if trade.get('signal_msg_id') else ""
                                 link_text = f"\n[🔗 Original Signal]({msg_link})" if msg_link else ""
-                                sl_message = f"⛔ *STOP LOSS HIT* ⛔\n*{symbol}* at {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n*Entry:* ${trade['entry_price']:.4f} ({'BUY' if trade['signal_type'] == 1 else 'SELL'})\n*SL Price:* ${current_price:.4f} (Hit SL @ ${trade['stop_loss']:.4f})\n*P/L:* {profit_pct:.2f}%{link_text}"
+                                sl_message = f"⛔ *STOP LOSS HIT* ⛔\n*{symbol}* at {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n*Entry:* ${trade_entry_price_float:.4f} ({'BUY' if trade['signal_type'] == 1 else 'SELL'})\n*SL Price:* ${current_price_float:.4f} (Hit SL @ ${trade_stop_loss_float:.4f})\n*P/L:* {profit_pct:.2f}%{link_text}"
                                 self.send_telegram_info(sl_message)
                                 trade_hit = True
                                 exit_reason = 'stop_loss'
                             
-                            elif (trade['signal_type'] == 1 and current_price >= trade['take_profit']) or \
-                                 (trade['signal_type'] == -1 and current_price <= trade['take_profit']):
-                                profit_pct = ((current_price - trade['entry_price']) / trade['entry_price'] * 100) if trade['signal_type'] == 1 else ((trade['entry_price'] - current_price) / trade['entry_price'] * 100)
+                            elif (trade['signal_type'] == 1 and current_price_float >= trade_take_profit_float) or \
+                                 (trade['signal_type'] == -1 and current_price_float <= trade_take_profit_float):
+                                profit_pct = ((current_price_float - trade_entry_price_float) / trade_entry_price_float * 100) if trade['signal_type'] == 1 else ((trade_entry_price_float - current_price_float) / trade_entry_price_float * 100)
                                 msg_link = self.get_telegram_message_link(trade.get('signal_chat_id'), trade.get('signal_msg_id')) if trade.get('signal_msg_id') else ""
                                 link_text = f"\n[🔗 Original Signal]({msg_link})" if msg_link else ""
-                                tp_message = f"💰 *TAKE PROFIT HIT* 💰\n*{symbol}* at {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n*Entry:* ${trade['entry_price']:.4f} ({'BUY' if trade['signal_type'] == 1 else 'SELL'})\n*TP Price:* ${current_price:.4f} (Hit TP @ ${trade['take_profit']:.4f})\n*Profit:* {profit_pct:.2f}%{link_text}"
+                                tp_message = f"💰 *TAKE PROFIT HIT* 💰\n*{symbol}* at {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n*Entry:* ${trade_entry_price_float:.4f} ({'BUY' if trade['signal_type'] == 1 else 'SELL'})\n*TP Price:* ${current_price_float:.4f} (Hit TP @ ${trade_take_profit_float:.4f})\n*Profit:* {profit_pct:.2f}%{link_text}"
                                 self.send_telegram_info(tp_message)
                                 self.successful_signals[symbol] += 1
                                 trade_hit = True
@@ -828,27 +842,25 @@ class KuCoinSwingBot:
 
                             if trade_hit:
                                 trade_result = {
-                                    'entry_time': trade['entry_time'].strftime("%Y-%m-%d %H:%M:%S"), 'entry_price': float(trade['entry_price']),
-                                    'exit_time': current_time.strftime("%Y-%m-%d %H:%M:%S"), 'exit_price': float(current_price),
+                                    'entry_time': trade['entry_time'].strftime("%Y-%m-%d %H:%M:%S"), 'entry_price': float(trade_entry_price_float),
+                                    'exit_time': current_time.strftime("%Y-%m-%d %H:%M:%S"), 'exit_price': float(current_price_float),
                                     'profit_pct': float(profit_pct), 'exit_reason': exit_reason,
                                     'signal_type': 'buy' if trade['signal_type'] == 1 else 'sell',
                                     'duration_minutes': ((current_time - trade['entry_time']).total_seconds() / 60),
-                                    'predicted_time': trade.get('time_to_profit', 0) # Use .get for safety
+                                    'predicted_time': trade.get('time_to_profit', 0) 
                                 }
                                 self.price_history[symbol]['trade_results'].append(trade_result)
                                 self.active_trades[symbol].remove(trade)
-                                self.save_price_history(symbol) # Save after each closed trade
-                                continue # Move to next active trade or out of loop
+                                self.save_price_history(symbol) 
+                                continue 
 
-                            # Trade time alert
-                            expected_duration_minutes = trade.get('time_to_profit', 60) # Default to 60 mins if not set
+                            expected_duration_minutes = trade.get('time_to_profit', 60) 
                             if (current_time - trade['entry_time']).total_seconds() / 60 > expected_duration_minutes * 2 and not trade.get('time_alert_sent'):
-                                current_pnl = ((current_price - trade['entry_price']) / trade['entry_price'] * 100 if trade['signal_type'] == 1 else (trade['entry_price'] - current_price) / trade['entry_price'] * 100)
-                                reminder_message = f"⏰ *TRADE TIME ALERT* ⏰\n*{symbol}* trade has exceeded 2x expected time.\n*Entry:* ${trade['entry_price']:.4f} ({'BUY' if trade['signal_type'] == 1 else 'SELL'})\n*Current P/L:* {current_pnl:.2f}%\n*Expected Duration:* {expected_duration_minutes} mins."
+                                current_pnl = ((current_price_float - trade_entry_price_float) / trade_entry_price_float * 100 if trade['signal_type'] == 1 else (trade_entry_price_float - current_price_float) / trade_entry_price_float * 100)
+                                reminder_message = f"⏰ *TRADE TIME ALERT* ⏰\n*{symbol}* trade has exceeded 2x expected time.\n*Entry:* ${trade_entry_price_float:.4f} ({'BUY' if trade['signal_type'] == 1 else 'SELL'})\n*Current P/L:* {current_pnl:.2f}%\n*Expected Duration:* {expected_duration_minutes} mins."
                                 self.send_telegram_info(reminder_message)
-                                trade['time_alert_sent'] = True # Mark that alert was sent
+                                trade['time_alert_sent'] = True 
 
-                        # Generate new trade signal using multi-timeframe logic
                         trade_signal_details = self.generate_final_trade_signal(symbol)
 
                         if trade_signal_details:
@@ -861,15 +873,15 @@ class KuCoinSwingBot:
                                 
                                 signal_message_text = (
                                     f"📈 {signal_dir_str} {symbol} 🚀\n\n"
-                                    f"Entry Price: {trade_signal_details['entry_price']:.4f}\n\n"
+                                    f"Entry Price: {float(trade_signal_details['entry_price']):.4f}\n\n"
                                     f"🎯 TP Targets:\n"
-                                    f"1️⃣ TP1: {trade_signal_details['TP1']:.4f}\n"
-                                    f"2️⃣ TP2: {trade_signal_details['TP2']:.4f}\n"
-                                    f"3️⃣ TP3: {trade_signal_details['TP3']:.4f}\n\n"
-                                    f"🛑 Stop Loss: {trade_signal_details['SL']:.4f}\n\n"
+                                    f"1️⃣ TP1: {float(trade_signal_details['TP1']):.4f}\n"
+                                    f"2️⃣ TP2: {float(trade_signal_details['TP2']):.4f}\n"
+                                    f"3️⃣ TP3: {float(trade_signal_details['TP3']):.4f}\n\n"
+                                    f"🛑 Stop Loss: {float(trade_signal_details['SL']):.4f}\n\n"
                                     f"📊 Market Context ({self.default_ohlcv_timeframe}):\n"
-                                    f"   Price: ${market_context['price']:.4f}\n   24h Change: {market_context['price_change_24h']:.2f}%\n"
-                                    f"   Volatility (ATR%): {market_context['volatility']:.2f}%\n   RSI: {market_context['rsi']:.2f}\n"
+                                    f"   Price: ${float(market_context['price']):.4f}\n   24h Change: {float(market_context['price_change_24h']):.2f}%\n"
+                                    f"   Volatility (ATR%): {float(market_context['volatility']):.2f}%\n   RSI: {float(market_context['rsi']):.2f}\n"
                                     f"   Trend (EMA): {market_context['trend']}\n   BB Position: {market_context['bollinger_position']}\n\n"
                                     f"Confidence: 🔥🔥🔥 (multi-timeframe alignment)"
                                 )
@@ -880,12 +892,12 @@ class KuCoinSwingBot:
                                 sent_telegram_obj = self.send_signal_message(signal_message_text)
                                 msg_id, chat_id = (sent_telegram_obj.message_id, sent_telegram_obj.chat.id) if sent_telegram_obj else (None, None)
 
-                                estimated_time_to_profit_active = 60 # Placeholder for active trades, can be refined
+                                estimated_time_to_profit_active = 60 
                                 new_trade = {
-                                    'entry_time': current_time, 'entry_price': trade_signal_details['entry_price'],
-                                    'signal_type': current_signal_numeric, 'stop_loss': trade_signal_details['SL'],
-                                    'take_profit': trade_signal_details['TP1'], # Manage against TP1 initially
-                                    'tp2': trade_signal_details['TP2'], 'tp3': trade_signal_details['TP3'],
+                                    'entry_time': current_time, 'entry_price': float(trade_signal_details['entry_price']),
+                                    'signal_type': current_signal_numeric, 'stop_loss': float(trade_signal_details['SL']),
+                                    'take_profit': float(trade_signal_details['TP1']), 
+                                    'tp2': float(trade_signal_details['TP2']), 'tp3': float(trade_signal_details['TP3']),
                                     'time_to_profit': estimated_time_to_profit_active,
                                     'signal_msg_id': msg_id, 'signal_chat_id': chat_id, 'time_alert_sent': False
                                 }
@@ -893,12 +905,11 @@ class KuCoinSwingBot:
                                 self.last_signal_time[symbol] = current_time
                                 self.last_signal_direction[symbol] = current_signal_numeric
                                 self.signals_generated[symbol] += 1
-                                logger.info(f"{symbol} - Signal: {signal_dir_str} sent. Entry: {trade_signal_details['entry_price']:.4f}, SL: {trade_signal_details['SL']:.4f}, TP1: {trade_signal_details['TP1']:.4f}")
+                                logger.info(f"{symbol} - Signal: {signal_dir_str} sent. Entry: {float(trade_signal_details['entry_price']):.4f}, SL: {float(trade_signal_details['SL']):.4f}, TP1: {float(trade_signal_details['TP1']):.4f}")
                             else:
                                 logger.info(f"{symbol} - Signal ({signal_dir_str}) for {symbol} is same as last or too recent. Not sending.")
                         
-                        # Periodically save history if many trades accumulate (though save on close is better)
-                        if len(self.price_history[symbol]['trade_results']) % 10 == 0 and len(self.price_history[symbol]['trade_results']) > 0 : # e.g. every 10 trades
+                        if len(self.price_history[symbol]['trade_results']) % 10 == 0 and len(self.price_history[symbol]['trade_results']) > 0 : 
                             if len(self.price_history[symbol]['trade_results']) > 200:
                                 self.price_history[symbol]['trade_results'] = self.price_history[symbol]['trade_results'][-200:]
                             self.save_price_history(symbol)
@@ -916,7 +927,7 @@ class KuCoinSwingBot:
                 except Exception as e:
                     logger.error(f"Error in monitoring loop: {str(e)}", exc_info=True)
                     self.send_telegram_info(f"⚠️ *Warning:* General error in monitoring loop: {str(e)}. Bot continues...")
-                    time.sleep(interval * 2) # Longer sleep for unexpected general errors
+                    time.sleep(interval * 2) 
                     
         except KeyboardInterrupt:
             logger.info("Bot stopping due to KeyboardInterrupt...")
@@ -924,10 +935,9 @@ class KuCoinSwingBot:
         finally:
             logger.info("Saving all price histories before full exit...")
             for symbol_to_save in self.symbols:
-                if self.price_history.get(symbol_to_save): # Ensure it exists
+                if self.price_history.get(symbol_to_save): 
                     self.save_price_history(symbol_to_save)
             logger.info("All price histories saved. Bot shutdown complete.")
-
 
 if __name__ == "__main__":
     bot = KuCoinSwingBot()
